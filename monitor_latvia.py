@@ -1,82 +1,68 @@
 #!/usr/bin/env python3
 
 """
-Latvijas Pasts suspension monitor.
+Latvijas Pasts suspension monitor
+---------------------------------
 
-WEBSITE 1
----------
-Collects destinations from BOTH explicitly requested sections:
+Checks two Latvijas Pasts pages:
 
-1. "Tuvo Austrumu galamērķi, uz kuriem nav iespējams
-   nosūtīt sūtījumus:"
+1. Aktuālā informācija par pārrobežu sūtījumu piegādes iespējām
+   - "Tuvo Austrumu galamērķi, uz kuriem nav iespējams nosūtīt sūtījumus:"
+   - "Pasta sūtījumu piegāde uz nenoteiktu laiku nav pieejama uz sekojošiem galamērķiem:"
 
-2. "Pasta sūtījumu piegāde uz nenoteiktu laiku nav pieejama
-   uz sekojošiem galamērķiem:"
+2. Valstu sadalījums
+   - Uses the embedded COUNTRIES JavaScript data.
+   - A country is considered suspended when it has a non-empty "warning".
 
-The two lists are combined and duplicates are removed.
-
-WEBSITE 2
----------
-Reads the embedded JavaScript COUNTRIES array and identifies
-countries having a non-empty "warning" field.
-
-No Playwright or browser automation is required.
-
-OUTPUT
-------
-Creates:
-
+The output is written to:
     output_latvia
-
-No timestamp is included so changedetection.io only detects
-actual changes in the monitored data.
 """
 
 # ============================================================
-# IMPORTS
+# Imports
 # ============================================================
 
 import html
 import json
 import re
 import sys
-from typing import Any, Dict, List
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 
 
 # ============================================================
-# CONFIGURATION
+# Configuration
 # ============================================================
 
 WEBSITE_1_URL = (
     "https://pasts.lv/aizliegumi/"
     "aktuala-informacija-par-parrobezu-sutijumu-piegades-iespejam"
+    "#aktuala-informacija-par-parrobezu-sutijumu-piegades-iespejam"
 )
 
 WEBSITE_2_URL = (
-    "https://pasts.lv/aizliegumi/valstu-sadalijums"
+    "https://pasts.lv/aizliegumi/"
+    "valstu-sadalijums?q=pale&r=0#valstu-sadalijums"
 )
 
-OUTPUT_FILE = "output_latvia"
+OUTPUT_FILE = Path("output_latvia")
 
 REQUEST_TIMEOUT = 30
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0 Safari/537.36"
+        "Chrome/140.0 Safari/537.36"
     ),
-    "Accept-Language": (
-        "lv-LV,lv;q=0.9,en-US;q=0.8,en;q=0.7"
-    ),
+    "Accept-Language": "lv-LV,lv;q=0.9,en;q=0.8",
 }
 
 
 # ============================================================
-# WEBSITE 1 — EXACT SECTION HEADINGS
+# Website 1 section headings
 # ============================================================
 
 SECTION_1_HEADING = (
@@ -91,13 +77,16 @@ SECTION_2_HEADING = (
 
 
 # ============================================================
-# WEBSITE 1 — LATVIAN -> ENGLISH
+# Known Website 1 Latvian -> English country names
+#
+# The website sometimes uses Latvian grammatical forms:
+#   Jemena -> Jemenu
+#   Sīrija -> Sīriju
+#   Irāna -> Irānu
+#
+# Keep both forms so changes in the page wording are detected.
 # ============================================================
 
-# These are the destinations currently used by Website 1.
-#
-# The parser recognizes both nominative and declined Latvian
-# forms where necessary.
 WEBSITE_1_NAME_MAP = {
     "Irāna": "Iran",
     "Irānu": "Iran",
@@ -114,666 +103,412 @@ WEBSITE_1_NAME_MAP = {
 
 
 # ============================================================
-# HTTP
+# HTTP helper
 # ============================================================
 
-def fetch_page(url: str) -> str:
-    """
-    Download a webpage.
-    """
-
-    try:
-        response = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            f"Could not download {url}: {exc}"
-        ) from exc
-
-    response.encoding = "utf-8"
-
+def fetch_page(url):
+    """Download a page and return its HTML."""
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
     return response.text
 
 
 # ============================================================
-# TEXT NORMALIZATION
+# Text normalization
 # ============================================================
 
-def normalize_text(value: str) -> str:
+def normalize_text(value):
     """
-    Normalize whitespace and HTML entities.
-
-    This also handles non-breaking spaces, which are important
-    because the Latvijas Pasts page can contain them around the
-    section headings.
+    Normalize whitespace and HTML entities while preserving
+    Latvian characters.
     """
+    if value is None:
+        return ""
 
-    value = html.unescape(value)
-
-    # Convert NBSP and similar whitespace to ordinary spaces.
+    value = html.unescape(str(value))
     value = value.replace("\xa0", " ")
 
-    # Normalize all whitespace runs.
+    # Normalize whitespace.
     value = re.sub(r"\s+", " ", value)
 
     return value.strip()
 
 
-def normalize_name(name: str) -> str:
+def normalize_for_match(value):
     """
-    Convert grammatical variants into one canonical Latvian name.
+    More aggressive normalization for matching headings.
     """
+    value = normalize_text(value)
 
-    name = normalize_text(name)
-
-    replacements = {
-        "Irānu": "Irāna",
-        "Jemenu": "Jemena",
-        "Sīriju": "Sīrija",
-    }
-
-    return replacements.get(name, name)
+    return value.casefold()
 
 
 # ============================================================
-# WEBSITE 1 — DESTINATION DETECTION
+# Website 1 helpers
 # ============================================================
 
-def find_section_text(
-    soup: BeautifulSoup,
-    heading: str,
-) -> str:
+def find_heading_positions(text, heading):
     """
-    Find one exact Website 1 heading and return the HTML/text
-    belonging to that section.
+    Find every occurrence of a heading in normalized page text.
 
-    We deliberately search the rendered document text rather than
-    depending on a particular CSS class or element type.
-
-    The function looks for the exact heading and then takes the
-    following document content until the next obvious section.
+    Returns character positions.
     """
+    normalized_text = normalize_for_match(text)
+    normalized_heading = normalize_for_match(heading)
 
-    wanted = normalize_text(heading).lower()
+    positions = []
 
-    # --------------------------------------------------------
-    # Get all visible text nodes in document order.
-    # --------------------------------------------------------
+    start = 0
 
-    text_nodes = []
+    while True:
+        position = normalized_text.find(normalized_heading, start)
 
-    for element in soup.find_all(
-        ["p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6"]
-    ):
-        text = normalize_text(
-            element.get_text(" ", strip=True)
-        )
-
-        if text:
-            text_nodes.append(
-                (
-                    element,
-                    text,
-                )
-            )
-
-    # --------------------------------------------------------
-    # Find the element containing the exact heading.
-    # --------------------------------------------------------
-
-    heading_index = None
-
-    for index, (_, text) in enumerate(text_nodes):
-        if text.lower() == wanted:
-            heading_index = index
+        if position == -1:
             break
 
-    # --------------------------------------------------------
-    # If exact matching failed, allow the heading to occur
-    # within the element text.
-    # --------------------------------------------------------
+        positions.append(position)
+        start = position + len(normalized_heading)
 
-    if heading_index is None:
-        for index, (_, text) in enumerate(text_nodes):
-            if wanted in text.lower():
-                heading_index = index
-                break
-
-    if heading_index is None:
-        return ""
-
-    # --------------------------------------------------------
-    # Collect following text.
-    #
-    # We don't need to know the exact HTML structure. Instead,
-    # we stop when another major heading appears.
-    # --------------------------------------------------------
-
-    collected = []
-
-    for _, text in text_nodes[heading_index + 1:]:
-        lower = text.lower()
-
-        # Another major heading usually marks the next section.
-        if (
-            lower.startswith("tuvo ")
-            or lower.startswith("pasta ")
-            or lower.startswith("sūtījumu ")
-            or lower.startswith("piegāde ")
-            or lower.startswith("svarīgi")
-            or lower.startswith("informācija")
-        ):
-            break
-
-        collected.append(text)
-
-        # The destination list is normally immediately after the
-        # heading. We only need a limited amount of text.
-        if len(collected) >= 10:
-            break
-
-    return " ".join(collected)
+    return positions
 
 
-def find_section_in_raw_text(
-    page_text: str,
-    heading: str,
-) -> str:
+def get_visible_page_text(html_source):
     """
-    Fallback parser.
+    Extract visible text from the page.
 
-    Finds an exact heading in normalized page text and returns
-    the text after it until the next known Website 1 heading.
+    Script/style/noscript contents are removed because they can
+    otherwise interfere with section detection.
     """
+    soup = BeautifulSoup(html_source, "html.parser")
 
-    text = normalize_text(page_text)
+    for tag in soup(["script", "style", "noscript", "template"]):
+        tag.decompose()
 
-    wanted = normalize_text(heading)
-
-    position = text.lower().find(
-        wanted.lower()
-    )
-
-    if position == -1:
-        return ""
-
-    start = position + len(wanted)
-
-    # Possible boundaries after the requested section.
-    boundaries = [
-        "Tuvo Austrumu galamērķi, uz kuriem nav iespējams",
-        "Pasta sūtījumu piegāde uz nenoteiktu laiku nav pieejama",
-        "Eiropas",
-        "Āfrikas",
-        "Amerikas",
-        "Āzijas",
-        "Austrālijas",
-    ]
-
-    end = len(text)
-
-    for boundary in boundaries:
-        boundary_position = text.lower().find(
-            boundary.lower(),
-            start,
-        )
-
-        if boundary_position != -1:
-            end = min(
-                end,
-                boundary_position,
-            )
-
-    return text[start:end].strip()
+    return normalize_text(soup.get_text(" ", strip=True))
 
 
-def extract_destinations_from_text(
-    section_text: str,
-) -> List[str]:
+def extract_country_names_from_section(section_text):
     """
-    Find known destinations inside one section.
+    Extract Website 1 destination names from one section.
 
-    This is intentionally based on destination names rather than
-    punctuation. Therefore a change from:
+    The current page contains four relevant destinations. We
+    deliberately search the entire section rather than relying
+    on a particular HTML container/list structure.
 
-        Iran, Yemen and Syria
-
-    to an HTML list such as:
-
-        <li>Iran</li>
-        <li>Yemen</li>
-        <li>Syria</li>
-
-    will still work.
+    This makes the parser resilient to changes such as:
+      <ul><li>...</li></ul>
+      <p>...</p>
+      <div>...</div>
+      or inline text.
     """
-
-    section_text = normalize_text(section_text)
-
-    if not section_text:
-        return []
-
     found = []
 
-    # Longest first so multi-word names are detected correctly.
-    names = sorted(
-        WEBSITE_1_NAME_MAP.keys(),
-        key=len,
+    normalized_section = normalize_for_match(section_text)
+
+    # Longest names first, so multi-word destinations are matched
+    # before shorter possible fragments.
+    candidates = sorted(
+        WEBSITE_1_NAME_MAP.items(),
+        key=lambda item: len(item[0]),
         reverse=True,
     )
 
-    for name in names:
-        # Case-insensitive substring matching.
-        if name.lower() not in section_text.lower():
-            continue
+    for latvian_name, english_name in candidates:
+        normalized_name = normalize_for_match(latvian_name)
 
-        canonical = normalize_name(name)
+        # Use a Unicode-aware boundary check.
+        pattern = r"(?<!\w)" + re.escape(normalized_name) + r"(?!\w)"
 
-        if canonical not in found:
-            found.append(canonical)
+        if re.search(pattern, normalized_section):
+            if english_name not in found:
+                found.append(english_name)
 
     return found
 
 
-def parse_website_1(
-    html_text: str,
-) -> List[Dict[str, str]]:
+def extract_website_1_sections(html_source):
     """
-    Parse BOTH requested Website 1 sections.
+    Extract BOTH Website 1 suspension sections independently.
 
-    The result is deduplicated across the two sections.
+    Important:
+    We do NOT assume that the second section is a sibling of the
+    first section in the HTML.
+
+    Instead, we work with the complete visible page text and use
+    the exact heading positions to define each section.
     """
+    page_text = get_visible_page_text(html_source)
 
-    soup = BeautifulSoup(
-        html_text,
-        "html.parser",
-    )
-
-    # --------------------------------------------------------
-    # Make a copy for visible text extraction.
-    # --------------------------------------------------------
-
-    for element in soup(
-        ["script", "style", "noscript"]
-    ):
-        element.decompose()
-
-    # --------------------------------------------------------
-    # SECTION 1
-    # --------------------------------------------------------
-
-    section_1_text = find_section_text(
-        soup,
+    # Find both headings in the actual rendered text.
+    heading_1_positions = find_heading_positions(
+        page_text,
         SECTION_1_HEADING,
     )
 
-    # If HTML structure did not expose it correctly, use raw
-    # page-text fallback.
-    if not section_1_text:
-        section_1_text = find_section_in_raw_text(
-            soup.get_text(" ", strip=True),
-            SECTION_1_HEADING,
-        )
-
-    section_1_destinations = (
-        extract_destinations_from_text(
-            section_1_text
-        )
-    )
-
-    # --------------------------------------------------------
-    # SECTION 2
-    # --------------------------------------------------------
-
-    section_2_text = find_section_text(
-        soup,
+    heading_2_positions = find_heading_positions(
+        page_text,
         SECTION_2_HEADING,
     )
 
-    # Fallback if necessary.
-    if not section_2_text:
-        section_2_text = find_section_in_raw_text(
-            soup.get_text(" ", strip=True),
-            SECTION_2_HEADING,
+    if not heading_1_positions:
+        raise RuntimeError(
+            "Website 1: could not find the first suspension heading."
         )
 
-    section_2_destinations = (
-        extract_destinations_from_text(
-            section_2_text
+    if not heading_2_positions:
+        raise RuntimeError(
+            "Website 1: could not find the second suspension heading."
         )
+
+    # Use the first occurrence of each exact heading.
+    heading_1_start = heading_1_positions[0]
+    heading_2_start = heading_2_positions[0]
+
+    heading_1_end = heading_1_start + len(
+        normalize_text(SECTION_1_HEADING)
+    )
+
+    heading_2_end = heading_2_start + len(
+        normalize_text(SECTION_2_HEADING)
     )
 
     # --------------------------------------------------------
-    # DIAGNOSTIC OUTPUT
+    # Section 1
+    #
+    # Everything after heading 1 and before heading 2 belongs
+    # to the first section.
     # --------------------------------------------------------
+
+    if heading_1_end < heading_2_start:
+        section_1_text = page_text[
+            heading_1_end:heading_2_start
+        ]
+    else:
+        # Defensive fallback if the order changes.
+        section_1_text = page_text[heading_1_end:]
+
+    # --------------------------------------------------------
+    # Section 2
+    #
+    # Everything after heading 2 is searched for destinations.
+    #
+    # We don't need to know the HTML structure. We only look
+    # for destination names that occur in this section.
+    # --------------------------------------------------------
+
+    section_2_text = page_text[heading_2_end:]
+
+    section_1_destinations = extract_country_names_from_section(
+        section_1_text
+    )
+
+    section_2_destinations = extract_country_names_from_section(
+        section_2_text
+    )
+
+    return section_1_destinations, section_2_destinations
+
+
+def check_website_1():
+    """
+    Check Website 1 and return one combined, deduplicated list.
+    """
+    print("Checking Website 1...")
+
+    html_source = fetch_page(WEBSITE_1_URL)
+
+    section_1, section_2 = extract_website_1_sections(
+        html_source
+    )
 
     print(
-        "Website 1 — first section:"
+        "Website 1 section 1 suspended destinations:",
+        len(section_1),
     )
+
+    for destination in section_1:
+        print("  -", destination)
+
     print(
-        f"  {section_1_destinations}"
+        "Website 1 section 2 suspended destinations:",
+        len(section_2),
     )
+
+    for destination in section_2:
+        print("  -", destination)
+
+    # --------------------------------------------------------
+    # Combine both sections and remove duplicates.
+    # --------------------------------------------------------
+
+    combined = []
+
+    for destination in section_1 + section_2:
+        if destination not in combined:
+            combined.append(destination)
 
     print(
-        "Website 1 — last section:"
-    )
-    print(
-        f"  {section_2_destinations}"
+        "Website 1 combined suspended destinations:",
+        len(combined),
     )
 
-    # --------------------------------------------------------
-    # COMBINE BOTH LISTS
-    # --------------------------------------------------------
+    for destination in combined:
+        print("  -", destination)
 
-    combined_names = []
-
-    for name in (
-        section_1_destinations
-        + section_2_destinations
-    ):
-        if name not in combined_names:
-            combined_names.append(name)
-
-    # --------------------------------------------------------
-    # Convert to Latvian + English.
-    # --------------------------------------------------------
-
-    result = []
-
-    for name_lv in combined_names:
-        name_en = WEBSITE_1_NAME_MAP.get(
-            name_lv
-        )
-
-        if not name_en:
-            print(
-                "WARNING: No English name mapping for "
-                f"{name_lv}",
-                file=sys.stderr,
-            )
-            continue
-
-        result.append(
-            {
-                "nameLv": name_lv,
-                "nameEn": name_en,
-            }
-        )
-
-    # Deterministic order.
-    result.sort(
-        key=lambda item: (
-            item["nameLv"].lower(),
-            item["nameEn"].lower(),
-        )
-    )
-
-    return result
+    return combined
 
 
 # ============================================================
-# WEBSITE 2 — COUNTRIES ARRAY
+# Website 2
 # ============================================================
 
-def extract_countries_array(
-    html_text: str,
-) -> List[Dict[str, Any]]:
+def extract_countries_array(html_source):
     """
-    Extract the embedded JavaScript COUNTRIES array.
-    """
+    Extract the embedded JavaScript:
 
-    # Primary declaration.
+        var COUNTRIES = [ ... ];
+
+    The array is JSON-compatible, so it can be decoded directly.
+    """
     pattern = re.compile(
-        r"\bvar\s+COUNTRIES\s*=\s*(\[[\s\S]*?\])\s*;",
-        re.MULTILINE,
+        r"\bvar\s+COUNTRIES\s*=\s*(\[.*?\])\s*;",
+        re.DOTALL,
     )
 
-    match = pattern.search(
-        html_text
-    )
-
-    # Future-proofing if declaration changes to const/let.
-    if not match:
-        pattern = re.compile(
-            r"\b(?:const|let)\s+COUNTRIES\s*=\s*"
-            r"(\[[\s\S]*?\])\s*;",
-            re.MULTILINE,
-        )
-
-        match = pattern.search(
-            html_text
-        )
+    match = pattern.search(html_source)
 
     if not match:
         raise RuntimeError(
-            "Could not find the COUNTRIES JavaScript array "
-            "on Website 2."
+            "Website 2: could not find embedded COUNTRIES data."
         )
 
-    array_text = match.group(1)
+    countries_json = match.group(1)
 
     try:
-        countries = json.loads(
-            array_text
-        )
-
+        return json.loads(countries_json)
     except json.JSONDecodeError as exc:
-        start = max(
-            0,
-            exc.pos - 150,
-        )
-
-        end = min(
-            len(array_text),
-            exc.pos + 150,
-        )
-
-        context = array_text[start:end]
-
         raise RuntimeError(
-            "Found COUNTRIES but could not parse it as JSON.\n"
-            f"Parser error: {exc}\n"
-            f"Context:\n{context}"
+            "Website 2: COUNTRIES data could not be parsed as JSON."
         ) from exc
 
-    if not isinstance(
-        countries,
-        list,
-    ):
-        raise RuntimeError(
-            "COUNTRIES was found but is not a list."
-        )
 
-    return countries
-
-
-# ============================================================
-# WEBSITE 2 — SUSPENSION RULE
-# ============================================================
-
-def country_is_suspended(
-    country: Dict[str, Any],
-) -> bool:
+def country_is_suspended(country):
     """
-    Website 2 uses country.warning to generate its visible
-    "Ņem vērā!" warning.
+    Determine whether Website 2 explicitly marks the country with
+    a warning.
 
-    Any non-empty warning therefore represents one of the
-    special destination restrictions we want to monitor.
+    This is intentionally based on `warning`, NOT simply on
+    letters == "Nē" or packets == "Nē".
 
-    We do NOT use letters == "Nē" by itself.
+    Some countries can have restricted letter services without
+    the entire destination being suspended.
     """
-
-    warning = country.get(
-        "warning"
-    )
+    warning = country.get("warning")
 
     if warning is None:
         return False
 
-    if not isinstance(
-        warning,
-        str,
-    ):
+    if not isinstance(warning, str):
         return bool(warning)
 
-    return bool(
-        warning.strip()
-    )
+    return bool(warning.strip())
 
 
-def parse_website_2(
-    html_text: str,
-) -> List[Dict[str, str]]:
+def check_website_2():
     """
-    Return all Website 2 countries having a warning.
+    Check Website 2 using the embedded COUNTRIES array.
     """
+    print("Checking Website 2...")
 
-    countries = extract_countries_array(
-        html_text
-    )
+    html_source = fetch_page(WEBSITE_2_URL)
+
+    countries = extract_countries_array(html_source)
 
     suspended = []
 
     for country in countries:
-        if not isinstance(
-            country,
-            dict,
-        ):
-            continue
+        if country_is_suspended(country):
+            name_lv = normalize_text(country.get("nameLv"))
+            name_en = normalize_text(country.get("nameEn"))
 
-        if not country_is_suspended(
-            country
-        ):
-            continue
+            if not name_lv:
+                continue
 
-        name_lv = str(
-            country.get(
-                "nameLv",
-                "",
+            suspended.append(
+                {
+                    "lv": name_lv,
+                    "en": name_en,
+                }
             )
-        ).strip()
 
-        name_en = str(
-            country.get(
-                "nameEn",
-                "",
-            )
-        ).strip()
-
-        code = str(
-            country.get(
-                "code",
-                "",
-            )
-        ).strip()
-
-        warning = str(
-            country.get(
-                "warning",
-                "",
-            )
-        ).strip()
-
-        if not name_lv or not name_en:
-            continue
-
-        suspended.append(
-            {
-                "code": code,
-                "nameLv": name_lv,
-                "nameEn": name_en,
-                "warning": warning,
-            }
-        )
-
-    # Deterministic ordering.
-    suspended.sort(
-        key=lambda item: (
-            item["nameLv"].lower(),
-            item["nameEn"].lower(),
-        )
+    print(
+        "Website 2 suspended countries:",
+        len(suspended),
     )
+
+    for country in suspended:
+        print(
+            "  -",
+            country["lv"],
+            "—",
+            country["en"],
+        )
 
     return suspended
 
 
 # ============================================================
-# OUTPUT
+# Output
 # ============================================================
 
-def make_output(
-    website_1: List[Dict[str, str]],
-    website_2: List[Dict[str, str]],
-) -> str:
+def build_output(website_1, website_2):
     """
-    Create deterministic output_latvia contents.
+    Build the final changedetection.io text file.
     """
-
     lines = []
 
-    lines.append(
-        "LATVIJAS PASTS — SUSPENDED DESTINATIONS"
-    )
-
+    lines.append("LATVIJAS PASTS — SUSPENDED DESTINATIONS")
     lines.append("")
-
-    # --------------------------------------------------------
-    # Website 1
-    # --------------------------------------------------------
-
+    lines.append("WEBSITE 1 — AKTUĀLĀ INFORMĀCIJA")
+    lines.append(f"Source: {WEBSITE_1_URL}")
     lines.append(
-        "WEBSITE 1 — AKTUĀLĀ INFORMĀCIJA"
+        f"Total suspended destinations: {len(website_1)}"
     )
 
-    lines.append(
-        f"Source: {WEBSITE_1_URL}"
-    )
+    for destination in website_1:
+        # Find Latvian name corresponding to the English name.
+        latvian_name = next(
+            (
+                lv
+                for lv, en in WEBSITE_1_NAME_MAP.items()
+                if en == destination
+                and lv not in {
+                    "Irānu",
+                    "Jemenu",
+                    "Sīriju",
+                }
+            ),
+            destination,
+        )
 
-    lines.append("")
-
-    lines.append(
-        f"Total suspended destinations: "
-        f"{len(website_1)}"
-    )
-
-    lines.append("")
-
-    for item in website_1:
         lines.append(
-            f"- {item['nameLv']} — {item['nameEn']}"
+            f"- {latvian_name} — {destination}"
         )
 
     lines.append("")
-
-    # --------------------------------------------------------
-    # Website 2
-    # --------------------------------------------------------
-
+    lines.append("WEBSITE 2 — VALSTU SADALĪJUMS")
+    lines.append(f"Source: {WEBSITE_2_URL}")
     lines.append(
-        "WEBSITE 2 — VALSTU SADALĪJUMS"
+        f"Total suspended countries: {len(website_2)}"
     )
 
-    lines.append(
-        f"Source: {WEBSITE_2_URL}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        f"Total suspended countries: "
-        f"{len(website_2)}"
-    )
-
-    lines.append("")
-
-    for item in website_2:
+    for country in website_2:
         lines.append(
-            f"- {item['nameLv']} — {item['nameEn']}"
+            f"- {country['lv']} — {country['en']}"
         )
 
     lines.append("")
@@ -782,124 +517,62 @@ def make_output(
 
 
 # ============================================================
-# MAIN
+# Main
 # ============================================================
 
-def main() -> int:
-    """
-    Run Website 1 and Website 2 checks.
-    """
-
-    print(
-        "Starting Latvijas Pasts suspension monitor..."
-    )
-
-    # ========================================================
-    # WEBSITE 1
-    # ========================================================
-
-    print(
-        "Checking Website 1..."
-    )
+def main():
+    print("Starting Latvijas Pasts suspension monitor...")
+    print()
 
     try:
-        website_1_html = fetch_page(
-            WEBSITE_1_URL
+        # ----------------------------------------------------
+        # Website 1
+        # ----------------------------------------------------
+        website_1 = check_website_1()
+
+        print()
+
+        # ----------------------------------------------------
+        # Website 2
+        # ----------------------------------------------------
+        website_2 = check_website_2()
+
+        print()
+
+        # ----------------------------------------------------
+        # Build and save output
+        # ----------------------------------------------------
+        output = build_output(
+            website_1,
+            website_2,
         )
 
-        website_1 = parse_website_1(
-            website_1_html
+        OUTPUT_FILE.write_text(
+            output,
+            encoding="utf-8",
         )
+
+        print(
+            f"Output written to {OUTPUT_FILE}"
+        )
+
+        print()
+        print("Done.")
+
+    except requests.RequestException as exc:
+        print(
+            f"ERROR: HTTP request failed: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     except Exception as exc:
         print(
-            "ERROR: Website 1 check failed: "
-            f"{exc}",
+            f"ERROR: {exc}",
             file=sys.stderr,
         )
-        return 1
+        sys.exit(1)
 
-    print(
-        "Website 1 suspended destinations: "
-        f"{len(website_1)}"
-    )
-
-    # ========================================================
-    # WEBSITE 2
-    # ========================================================
-
-    print(
-        "Checking Website 2..."
-    )
-
-    try:
-        website_2_html = fetch_page(
-            WEBSITE_2_URL
-        )
-
-        website_2 = parse_website_2(
-            website_2_html
-        )
-
-    except Exception as exc:
-        print(
-            "ERROR: Website 2 check failed: "
-            f"{exc}",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(
-        "Website 2 suspended countries: "
-        f"{len(website_2)}"
-    )
-
-    # ========================================================
-    # WRITE OUTPUT
-    # ========================================================
-
-    output = make_output(
-        website_1,
-        website_2,
-    )
-
-    with open(
-        OUTPUT_FILE,
-        "w",
-        encoding="utf-8",
-        newline="\n",
-    ) as file:
-        file.write(
-            output
-        )
-
-    # ========================================================
-    # DISPLAY OUTPUT
-    # ========================================================
-
-    print("")
-    print(
-        "Generated output_latvia:"
-    )
-    print(
-        "----------------------------------------"
-    )
-    print(
-        output,
-        end="",
-    )
-    print(
-        "----------------------------------------"
-    )
-
-    return 0
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
-    sys.exit(
-        main()
-    )
+    main()
